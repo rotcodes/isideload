@@ -188,6 +188,11 @@ impl Application {
         let mut bundles_with_app_id = vec![&self.bundle];
         bundles_with_app_id.extend(extension_refs);
 
+        let needed_ids: Vec<String> = bundles_with_app_id
+            .iter()
+            .map(|b| b.bundle_identifier().unwrap_or("").to_string())
+            .collect();
+
         let list_app_ids_response = dev_session
             .list_app_ids(team, None)
             .await
@@ -209,22 +214,61 @@ impl Application {
                     "Apple reports a negative number of available app IDs ({}), which shouldn't be possible.",
                     available
                 );
-                // Since the App IDs should never be negative in the first place, it might still be worth trying to register them anyways. Who knows.
-            } else {
-                // We only do the conversion if available is positive, else we get an integral conversion error
-                if app_ids_to_register.len() > available.try_into()? {
+            } else if app_ids_to_register.len() > available.try_into().unwrap_or(0usize) {
+                let slots_needed = app_ids_to_register.len() - available.max(0) as usize;
+                info!(
+                    "Not enough app ID slots ({} available, {} needed). Auto-cleaning {} unused app IDs...",
+                    available,
+                    app_ids_to_register.len(),
+                    slots_needed
+                );
+
+                let protected_prefixes = [
+                    "com.SideStore.SideStore",
+                    "com.rileytestut.AltStore",
+                    "app.stik.store",
+                    "com.kdt.livecontainer",
+                ];
+
+                let mut deletable: Vec<&AppId> = list_app_ids_response
+                    .app_ids
+                    .iter()
+                    .filter(|existing| {
+                        let id = &existing.identifier;
+                        let is_needed = needed_ids.iter().any(|n| n == id);
+                        let is_protected = protected_prefixes
+                            .iter()
+                            .any(|prefix| id.starts_with(prefix));
+                        !is_needed && !is_protected
+                    })
+                    .collect();
+
+                deletable.sort_by(|a, b| a.expiration_date.cmp(&b.expiration_date));
+
+                if deletable.len() < slots_needed {
                     bail!(
-                        "Not enough available app IDs. {} {} required, but only {} {} available.",
-                        app_ids_to_register.len(),
-                        if app_ids_to_register.len() == 1 {
-                            "is"
-                        } else {
-                            "are"
-                        },
-                        available,
-                        if available == 1 { "is" } else { "are" }
+                        "Not enough deletable app IDs. Need to free {} slots but only {} non-protected IDs available for cleanup. \
+                         Protected IDs (SideStore, AltStore, StikStore, LiveContainer) are never auto-deleted.",
+                        slots_needed,
+                        deletable.len()
                     );
                 }
+
+                for app_id in deletable.iter().take(slots_needed) {
+                    info!(
+                        "Auto-deleting app ID: {} ({})",
+                        app_id.name, app_id.identifier
+                    );
+                    dev_session
+                        .delete_app_id(team, &app_id.app_id_id, None)
+                        .await
+                        .context(format!(
+                            "Failed to auto-delete app ID {} ({})",
+                            app_id.name, app_id.identifier
+                        ))?;
+                }
+
+                info!("Freed {} app ID slots via auto-cleanup", slots_needed);
             }
         }
 
