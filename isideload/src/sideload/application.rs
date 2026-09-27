@@ -243,7 +243,11 @@ impl Application {
                     })
                     .collect();
 
-                deletable.sort_by(|a, b| a.expiration_date.as_ref().cmp(&b.expiration_date.as_ref()));
+                deletable.sort_by(|a, b| {
+                    a.expiration_date
+                        .partial_cmp(&b.expiration_date)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
 
                 if deletable.len() < slots_needed {
                     bail!(
