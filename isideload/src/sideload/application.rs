@@ -208,78 +208,125 @@ impl Application {
             })
             .collect::<Vec<_>>();
 
-        if let Some(available) = list_app_ids_response.available_quantity {
-            if available < 0 {
+        let max_ids = list_app_ids_response.max_quantity.unwrap_or(10) as usize;
+        let existing_count = list_app_ids_response.app_ids.len();
+        let available = match list_app_ids_response.available_quantity {
+            Some(q) if q >= 0 => q as usize,
+            Some(q) => {
                 warn!(
-                    "Apple reports a negative number of available app IDs ({}), which shouldn't be possible.",
-                    available
+                    "Apple reports a negative number of available app IDs ({}), treating as 0.",
+                    q
                 );
-            } else if app_ids_to_register.len() > available.try_into().unwrap_or(0usize) {
-                let slots_needed = app_ids_to_register.len() - available.max(0) as usize;
-                info!(
-                    "Not enough app ID slots ({} available, {} needed). Auto-cleaning {} unused app IDs...",
-                    available,
-                    app_ids_to_register.len(),
-                    slots_needed
-                );
-
-                let protected_prefixes = [
-                    "com.SideStore.SideStore",
-                    "com.rileytestut.AltStore",
-                    "app.stik.store",
-                    "com.kdt.livecontainer",
-                ];
-
-                let mut deletable: Vec<&AppId> = list_app_ids_response
-                    .app_ids
-                    .iter()
-                    .filter(|existing| {
-                        let id = &existing.identifier;
-                        let is_needed = needed_ids.iter().any(|n| n == id);
-                        let is_protected = protected_prefixes
-                            .iter()
-                            .any(|prefix| id.starts_with(prefix));
-                        !is_needed && !is_protected
-                    })
-                    .collect();
-
-                deletable.sort_by(|a, b| {
-                    let a_date = a.expiration_date.as_ref().map(|d| d.to_xml_format());
-                    let b_date = b.expiration_date.as_ref().map(|d| d.to_xml_format());
-                    a_date.cmp(&b_date)
-                });
-
-                if deletable.len() < slots_needed {
-                    bail!(
-                        "Not enough deletable app IDs. Need to free {} slots but only {} non-protected IDs available for cleanup. \
-                         Protected IDs (SideStore, AltStore, StikStore, LiveContainer) are never auto-deleted.",
-                        slots_needed,
-                        deletable.len()
-                    );
-                }
-
-                for app_id in deletable.iter().take(slots_needed) {
-                    info!(
-                        "Auto-deleting app ID: {} ({})",
-                        app_id.name, app_id.identifier
-                    );
-                    dev_session
-                        .delete_app_id(team, &app_id.app_id_id, None)
-                        .await
-                        .context(format!(
-                            "Failed to auto-delete app ID {} ({})",
-                            app_id.name, app_id.identifier
-                        ))?;
-                }
-
-                info!("Freed {} app ID slots via auto-cleanup", slots_needed);
+                0
             }
+            None => max_ids.saturating_sub(existing_count),
+        };
+
+        if !app_ids_to_register.is_empty() && app_ids_to_register.len() > available {
+            let slots_needed = app_ids_to_register.len() - available;
+            info!(
+                "Not enough app ID slots ({} available, {} needed). Auto-cleaning {} unused app IDs...",
+                available,
+                app_ids_to_register.len(),
+                slots_needed
+            );
+
+            let protected_prefixes = [
+                "com.SideStore.SideStore",
+                "com.rileytestut.AltStore",
+                "app.stik.store",
+                "com.kdt.livecontainer",
+            ];
+
+            let mut deletable: Vec<&AppId> = list_app_ids_response
+                .app_ids
+                .iter()
+                .filter(|existing| {
+                    let id = &existing.identifier;
+                    let is_needed = needed_ids.iter().any(|n| n == id);
+                    let is_protected = protected_prefixes
+                        .iter()
+                        .any(|prefix| id.starts_with(prefix));
+                    !is_needed && !is_protected
+                })
+                .collect();
+
+            deletable.sort_by(|a, b| {
+                let a_date = a.expiration_date.as_ref().map(|d| d.to_xml_format());
+                let b_date = b.expiration_date.as_ref().map(|d| d.to_xml_format());
+                a_date.cmp(&b_date)
+            });
+
+            if deletable.len() < slots_needed {
+                bail!(
+                    "Not enough deletable app IDs. Need to free {} slots but only {} non-protected IDs available for cleanup. \
+                     Protected IDs (SideStore, AltStore, StikStore, LiveContainer) are never auto-deleted.",
+                    slots_needed,
+                    deletable.len()
+                );
+            }
+
+            for app_id in deletable.iter().take(slots_needed) {
+                info!(
+                    "Auto-deleting app ID: {} ({})",
+                    app_id.name, app_id.identifier
+                );
+                dev_session
+                    .delete_app_id(team, &app_id.app_id_id, None)
+                    .await
+                    .context(format!(
+                        "Failed to auto-delete app ID {} ({})",
+                        app_id.name, app_id.identifier
+                    ))?;
+            }
+
+            info!("Freed {} app ID slots via auto-cleanup", slots_needed);
         }
 
-        for bundle in app_ids_to_register {
+        for bundle in &app_ids_to_register {
             let id = bundle.bundle_identifier().unwrap_or("");
             let name = bundle.bundle_name().unwrap_or("");
-            dev_session.add_app_id(team, name, id, None).await?;
+            match dev_session.add_app_id(team, name, id, None).await {
+                Ok(_) => {}
+                Err(e) if e.to_string().contains("9120") || e.to_string().contains("maximum") => {
+                    warn!("App ID add failed with limit error, attempting emergency cleanup...");
+                    let fresh_list = dev_session.list_app_ids(team, None).await?;
+                    let protected_prefixes = [
+                        "com.SideStore.SideStore",
+                        "com.rileytestut.AltStore",
+                        "app.stik.store",
+                        "com.kdt.livecontainer",
+                    ];
+                    let mut deletable: Vec<&AppId> = fresh_list
+                        .app_ids
+                        .iter()
+                        .filter(|existing| {
+                            let eid = &existing.identifier;
+                            let is_needed = needed_ids.iter().any(|n| n == eid);
+                            let is_protected = protected_prefixes
+                                .iter()
+                                .any(|prefix| eid.starts_with(prefix));
+                            !is_needed && !is_protected
+                        })
+                        .collect();
+                    deletable.sort_by(|a, b| {
+                        let a_date = a.expiration_date.as_ref().map(|d| d.to_xml_format());
+                        let b_date = b.expiration_date.as_ref().map(|d| d.to_xml_format());
+                        a_date.cmp(&b_date)
+                    });
+                    if let Some(victim) = deletable.first() {
+                        info!("Emergency deleting app ID: {} ({})", victim.name, victim.identifier);
+                        dev_session
+                            .delete_app_id(team, &victim.app_id_id, None)
+                            .await
+                            .context("Failed emergency app ID cleanup")?;
+                        dev_session.add_app_id(team, name, id, None).await?;
+                    } else {
+                        return Err(e.into());
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
         let list_app_id_response = dev_session.list_app_ids(team, None).await?;
         let app_ids: Vec<_> = list_app_id_response
