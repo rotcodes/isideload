@@ -244,9 +244,9 @@ impl Application {
                     .collect();
 
                 deletable.sort_by(|a, b| {
-                    a.expiration_date
-                        .partial_cmp(&b.expiration_date)
-                        .unwrap_or(std::cmp::Ordering::Equal)
+                    let a_date = a.expiration_date.as_ref().map(|d| d.to_xml_format());
+                    let b_date = b.expiration_date.as_ref().map(|d| d.to_xml_format());
+                    a_date.cmp(&b_date)
                 });
 
                 if deletable.len() < slots_needed {
